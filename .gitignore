@@ -1,0 +1,17 @@
+# HLS output (segmentos y playlists)
+app/www/hls/
+
+# Logs & cache
+app/www/logs/
+app/www/cache/
+*.log
+
+# Temp files
+*.pid
+*.sock
+
+# Vendor (si llegas a usar Composer)
+vendor/
+
+# Entornos (si los usas)
+.env

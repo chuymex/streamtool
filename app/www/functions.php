@@ -1,0 +1,609 @@
+<?php
+
+/**
+ * Redirige a una URL tras X milisegundos usando JavaScript.
+ */
+function redirect($url, $time)
+{
+    echo "<script>
+                window.setTimeout(function(){
+                    window.location.href = '" . $url . "';
+                }, " . $time . ");
+            </script>";
+}
+
+/**
+ * Cierra la sesión y vuelve al login si se llama con ?logout=1
+ */
+if (isset($_GET['logout'])) {
+    session_destroy();
+    header("location: index.php");
+}
+
+/**
+ * Verifica si hay sesión de usuario; si no, redirige al login.
+ */
+function logincheck()
+{
+    if (!isset($_SESSION['user_id'])) {
+        header("location: index.php");
+    }
+}
+
+/**
+ * Extrae una columna ($column) de una colección Eloquent ($list) a un array plano.
+ */
+function lists($list, $column)
+{
+    $columns = [];
+    foreach ($list->toArray() as $key => $value) {
+        array_push($columns, $value[$column]);
+    }
+
+    return $columns;
+}
+
+/**
+ * Devuelve un color aproximado según un porcentaje ($pr) para barras.
+ */
+function barColor($pr)
+{
+    $color = "red";
+    if ($pr < 75) {
+        $color = "orange";
+    }
+    if ($pr < 50) {
+        $color = "green";
+    }
+    if ($pr < 25) {
+        $color = "green";
+    }
+    return $color;
+}
+
+/**
+ * Comprueba si un PID existe en el sistema.
+ */
+function checkPid($pid)
+{
+    exec("ps $pid", $output, $result);
+    return count($output) >= 2 ? true : false;
+}
+
+/**
+ * Convierte un CSV a array asociativo.
+ */
+function csv_to_array($filename = '', $delimiter = ',')
+{
+    if (!file_exists($filename) || !is_readable($filename))
+        return FALSE;
+
+    $header = NULL;
+    $data = array();
+    if (($handle = fopen($filename, 'r')) !== FALSE) {
+        while (($row = fgetcsv($handle, 1000, $delimiter)) !== FALSE) {
+            if (!$header)
+                $header = $row;
+            else
+                $data[] = array_combine($header, $row);
+        }
+        fclose($handle);
+    }
+    return $data;
+}
+
+/**
+ * Descarga y ejecuta el patch de nvidia-patch.
+ * OJO: ejecuta un script externo con sudo; úsalo bajo tu propio riesgo.
+ */
+function patchnv()
+{
+    copy('https://raw.githubusercontent.com/keylase/nvidia-patch/master/patch.sh', '/tmp/patch.sh');
+    $patchresult = shell_exec('chmod +x /tmp/patch.sh; /usr/bin/sudo /tmp/patch.sh');
+    return $patchresult;
+}
+
+/**
+ * Detiene un stream:
+ * - Mata el proceso ffmpeg asociado (PID guardado en BD).
+ * - Borra segmentos HLS y archivos asociados.
+ * - Resetea flags de running/status/duration y uptime_started_at.
+ */
+function stop_stream($id)
+{
+    $stream = Stream::find($id);
+    $setting = Setting::first();
+
+    if ($stream && checkPid($stream->pid)) {
+        shell_exec("kill -9 " . $stream->pid);
+        shell_exec("/bin/rm -r /opt/streamtool/app/www/" . $setting->hlsfolder . "/" . $stream->id . "*");
+    }
+
+    if ($stream) {
+        $stream->pid = "0";
+        $stream->running = 0;
+        $stream->status = 0;
+        $stream->duration = 0;
+        // Limpiamos el inicio de uptime al parar el stream
+        $stream->uptime_started_at = null;
+        $stream->save();
+    }
+}
+
+/**
+ * Formatea una cantidad de segundos a texto tipo "Xd Yh Zm Ts".
+ * (No se usa para uptime, pero se deja para compatibilidad con otras partes.)
+ */
+function secondsToTime($seconds) {
+    $dtF = new \DateTime('@0');
+    $dtT = new \DateTime("@$seconds");
+    return $dtF->diff($dtT)->format('%ad %hh %im %ss');
+}
+
+/**
+ * NUEVO HELPER: formatea una fecha de inicio ($startedAt) a uptime HH:MM:SS.
+ * Devuelve "-" si no hay dato válido.
+ */
+function format_uptime($startedAt)
+{
+    if (empty($startedAt)) {
+        return '-';
+    }
+
+    $start = strtotime($startedAt);
+    if ($start === false) {
+        return '-';
+    }
+
+    $now = time();
+    $diff = $now - $start;
+    if ($diff < 0) {
+        $diff = 0;
+    }
+
+    $hours   = floor($diff / 3600);
+    $minutes = floor(($diff % 3600) / 60);
+    $seconds = $diff % 60;
+
+    return sprintf('%02d:%02d:%02d', $hours, $minutes, $seconds);
+}
+
+/**
+ * Construye el comando ffmpeg según el perfil de transcodificación y stream.
+ */
+function getTranscode($id, $streamnumber = null)
+{
+    $stream = Stream::find($id);
+    $setting = Setting::first();
+    $trans = $stream->transcode;
+    $ffmpeg = $setting->ffmpeg_path;
+
+    // Selecciona URL según streamnumber (1,2,3)
+    $url = $stream->streamurl;
+    if ($streamnumber == 2) {
+        $url = $stream->streamurl2;
+    }
+    if ($streamnumber == 3) {
+        $url = $stream->streamurl3;
+    }
+
+    // Parte común de salida HLS/segmentos
+    $endofffmpeg = "";
+    $endofffmpeg .= $stream->bitstreamfilter ? ' -bsf h264_mp4toannexb' : '';
+    // Segmentación TS con lista M3U8 y flags de live+delete
+    $endofffmpeg .= ' -f segment -segment_format mpegts -segment_time 6 -segment_list_size 5 -segment_format_options mpegts_flags=+initial_discontinuity:mpegts_copyts=1 -segment_list_type m3u8 -segment_list_flags +live+delete';
+    $endofffmpeg .= ' -segment_list /opt/streamtool/app/www/' . $setting->hlsfolder . '/' . $stream->id . '_.m3u8 /opt/streamtool/app/www/' . $setting->hlsfolder . '/' . $stream->id . '_%d.ts';
+    // Archivo de progreso que el panel puede usar para estadísticas
+    $endofffmpeg .= ' -progress /opt/streamtool/app/www/' . $setting->hlsfolder . '/' . $stream->id . '_.stats';
+
+    // Si hay perfil de transcodificación, arma el comando completo
+    if ($trans) {
+        $ffmpeg .= ' -y -thread_queue_size 512 -loglevel error -fflags nobuffer -flags low_delay -fflags +genpts -strict experimental -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -err_detect ignore_err';
+        $ffmpeg .= ' -probesize ' . ($trans->probesize ? $trans->probesize : '1000000');
+        $ffmpeg .= ' -analyzeduration ' . ($trans->analyzeduration ? $trans->analyzeduration : '1000000');
+        $ffmpeg .= ' -user_agent "' . ($setting->user_agent ? $setting->user_agent : 'Streamtool') . '"';
+        $nvencpos = 0;
+
+        // Soporte básico para NVENC
+        if (strpos($trans->video_codec, 'nvenc')) {
+            $ffmpeg .= ' -hwaccel cuvid';
+            if (strpos($stream->video_codec_name, '264') !== false) {
+                $ffmpeg .= ' -c:v h264_cuvid';
+                $nvencpos = 1;
+            }
+            if (strpos($stream->video_codec_name, 'hevc') !== false) {
+                $ffmpeg .= ' -c:v hevc_cuvid';
+                $nvencpos = 1;
+            }
+            if (strpos($stream->video_codec_name, 'mpeg') !== false) {
+                $ffmpeg .= ' -c:v mpeg_cuvid';
+                $nvencpos = 1;
+            }
+            if (strpos($stream->video_codec_name, 'mpeg2') !== false) {
+                $ffmpeg .= ' -c:v mpeg2_cuvid';
+                $nvencpos = 1;
+            }
+            if (strpos($stream->video_codec_name, 'mjpeg') !== false) {
+                $ffmpeg .= ' -c:v mjpeg_cuvid';
+                $nvencpos = 1;
+            }
+            if (strpos($stream->video_codec_name, 'av1') !== false) {
+                $ffmpeg .= ' -c:v av1_cuvid';
+                $nvencpos = 1;
+            }
+            if (strpos($stream->video_codec_name, 'vc1') !== false) {
+                $ffmpeg .= ' -c:v vc1_cuvid';
+                $nvencpos = 1;
+            }
+            if (strpos($stream->video_codec_name, 'vp8') !== false) {
+                $ffmpeg .= ' -c:v vp8_cuvid';
+                $nvencpos = 1;
+            }
+            if (strpos($stream->video_codec_name, 'vp9') !== false) {
+                $ffmpeg .= ' -c:v vp9_cuvid';
+                $nvencpos = 1;
+            }
+        }
+
+        // Entrada principal
+        $ffmpeg .= ' -i ' . '"' . "$url" . '"';
+        // Logo opcional
+        $ffmpeg .= $trans->logo ? ' -i ' . '"' . $trans->logo_path . '"' : '';
+        $ffmpeg .= ' -strict -2 -dn -map v? -map a? -map s? -scodec copy';
+        $ffmpeg .= $trans->scale ? ' -vf scale=' . ($trans->scale ? $trans->scale : '') : '';
+        $ffmpeg .= $trans->audio_codec ? ' -acodec ' . $trans->audio_codec : '';
+        $ffmpeg .= $trans->video_codec ? ' -vcodec ' . $trans->video_codec : '';
+        $ffmpeg .= $trans->profile ? ' -profile:v ' . $trans->profile : '';
+        $ffmpeg .= $trans->preset ? ' -preset ' . $trans->preset_values : '';
+        $ffmpeg .= $trans->video_bitrate ? ' -b:v ' . $trans->video_bitrate . 'k' : '';
+        $ffmpeg .= $trans->audio_bitrate ? ' -b:a ' . $trans->audio_bitrate . 'k' : '';
+        $ffmpeg .= $trans->fps ? ' -r ' . $trans->fps : '';
+        $ffmpeg .= $trans->minrate ? ' -minrate ' . $trans->minrate . 'k' : '';
+        $ffmpeg .= $trans->maxrate ? ' -maxrate ' . $trans->maxrate . 'k' : '';
+        $ffmpeg .= $trans->bufsize ? ' -bufsize ' . $trans->bufsize . 'k' : '';
+        $ffmpeg .= $trans->aspect_ratio ? ' -aspect ' . $trans->aspect_ratio : '';
+        $ffmpeg .= $trans->audio_sampling_rate ? ' -ar ' . $trans->audio_sampling_rate : '';
+        $ffmpeg .= $trans->crf ? ' -crf ' . $trans->crf : '';
+        $ffmpeg .= $trans->audio_channel ? ' -ac ' . $trans->audio_channel : '';
+        $ffmpeg .= $stream->bitstreamfilter ? ' -bsf h264_mp4toannexb' : '';
+        $ffmpeg .= $trans->threads ? ' -threads ' . $trans->threads : '';
+        $ffmpeg .= $trans->deinterlance ? ($nvencpos ? ' -vf yadif_cuda' : ' -vf yadif') : '';
+        $ffmpeg .= $trans->logo ? ($nvencpos ? ' -filter_complex "[1:v]format=nv12,hwupload[img];[0:v][img]overlay_cuda=x=0:y=0"' : ' -filter_complex "overlay=0:0"') : '';
+        $ffmpeg .= $endofffmpeg;
+
+        // Log de comando para debug
+        file_put_contents('/tmp/streamtool-ffmpeg_' . $id . '.log', $ffmpeg . PHP_EOL , FILE_APPEND);
+        return $ffmpeg;
+    }
+
+    // Modo copy sin perfil de transcodificación
+    $ffmpeg .= ' -y -thread_queue_size 512 -loglevel error -fflags nobuffer -flags low_delay -fflags +genpts -strict experimental -reconnect 1 -reconnect_streamed 1  -reconnect_delay_max 2 -err_detect ignore_err';
+    $ffmpeg .= ' -user_agent "' . ($setting->user_agent ? $setting->user_agent : 'Streamtool') . '"';
+    $ffmpeg .= ' -i "' . $url . '"';
+    $ffmpeg .= ' -map v? -map a? -map s? -c:v copy -c:a copy -c:s copy';
+    $ffmpeg .= $endofffmpeg;
+    return $ffmpeg;
+}
+
+/**
+ * Genera comando de ffmpeg para mostrar info de transcode (en UI).
+ */
+function getTranscodedata($id)
+{
+    $stream = Stream::find($id);
+    $trans = Transcode::find($id);
+    $setting = Setting::first();
+    $ffmpeg = $setting->ffmpeg_path;
+    $ffmpeg .= ' -y -thread_queue_size 512 -loglevel error -fflags nobuffer -flags low_delay -fflags +genpts -strict experimental -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -err_detect ignore_err';
+    $ffmpeg .= ' -probesize ' . ($trans->probesize ? $trans->probesize : '1000000');
+    $ffmpeg .= ' -analyzeduration ' . ($trans->analyzeduration ? $trans->analyzeduration : '1000000');
+    $ffmpeg .= ' -user_agent "' . ($setting->user_agent ? $setting->user_agent : 'Streamtool') . '"';
+    $nvencpos = 0;
+
+    // Soporte NVENC también aquí
+    if (strpos($trans->video_codec, 'nvenc')) {
+        $ffmpeg .= ' -hwaccel cuvid';
+        if (strpos($stream->video_codec_name, '264') !== false) {
+            $ffmpeg .= ' -c:v h264_cuvid';
+            $nvencpos = 1;
+        }
+        if (strpos($stream->video_codec_name, 'hevc') !== false) {
+            $ffmpeg .= ' -c:v hevc_cuvid';
+            $nvencpos = 1;
+        }
+        if (strpos($stream->video_codec_name, 'mpeg') !== false) {
+            $ffmpeg .= ' -c:v mpeg_cuvid';
+            $nvencpos = 1;
+        }
+        if (strpos($stream->video_codec_name, 'mpeg2') !== false) {
+            $ffmpeg .= ' -c:v mpeg2_cuvid';
+            $nvencpos = 1;
+        }
+        if (strpos($stream->video_codec_name, 'mjpeg') !== false) {
+            $ffmpeg .= ' -c:v mjpeg_cuvid';
+            $nvencpos = 1;
+        }
+        if (strpos($stream->video_codec_name, 'av1') !== false) {
+            $ffmpeg .= ' -c:v av1_cuvid';
+            $nvencpos = 1;
+        }
+        if (strpos($stream->video_codec_name, 'vc1') !== false) {
+            $ffmpeg .= ' -c:v vc1_cuvid';
+            $nvencpos = 1;
+        }
+        if (strpos($stream->video_codec_name, 'vp8') !== false) {
+            $ffmpeg .= ' -c:v vp8_cuvid';
+            $nvencpos = 1;
+        }
+        if (strpos($stream->video_codec_name, 'vp9') !== false) {
+            $ffmpeg .= ' -c:v vp9_cuvid';
+            $nvencpos = 1;
+        }
+    }
+
+    $ffmpeg .= ' -i ' . '"' . "[input]" . '"';
+    $ffmpeg .= ' -strict -2 -dn ';
+    $ffmpeg .= $trans->scale ? ' -vf scale=' . ($trans->scale ? $trans->scale : '') : '';
+    $ffmpeg .= $trans->audio_codec ? ' -acodec ' . $trans->audio_codec : '';
+    $ffmpeg .= $trans->video_codec ? ' -vcodec ' . $trans->video_codec : '';
+    $ffmpeg .= $trans->profile ? ' -profile:v ' . $trans->profile : '';
+    $ffmpeg .= $trans->preset ? ' -preset ' . $trans->preset_values : '';
+    $ffmpeg .= $trans->video_bitrate ? ' -b:v ' . $trans->video_bitrate . 'k' : '';
+    $ffmpeg .= $trans->audio_bitrate ? ' -b:a ' . $trans->audio_bitrate . 'k' : '';
+    $ffmpeg .= $trans->fps ? ' -r ' . $trans->fps : '';
+    $ffmpeg .= $trans->minrate ? ' -minrate ' . $trans->minrate . 'k' : '';
+    $ffmpeg .= $trans->maxrate ? ' -maxrate ' . $trans->maxrate . 'k' : '';
+    $ffmpeg .= $trans->bufsize ? ' -bufsize ' . $trans->bufsize . 'k' : '';
+    $ffmpeg .= $trans->aspect_ratio ? ' -aspect ' . $trans->aspect_ratio : '';
+    $ffmpeg .= $trans->audio_sampling_rate ? ' -ar ' . $trans->audio_sampling_rate : '';
+    $ffmpeg .= $trans->crf ? ' -crf ' . $trans->crf : '';
+    $ffmpeg .= $trans->audio_channel ? ' -ac ' . $trans->audio_channel : '';
+    $ffmpeg .= $trans->threads ? ' -threads ' . $trans->threads : '';
+    $ffmpeg .= $trans->deinterlance ? ($nvencpos ? ' -vf yadif_cuda' : ' -vf yadif') : '';
+    $ffmpeg .= " [OUTPUT]";
+    return $ffmpeg;
+}
+
+/**
+ * Arranca un stream:
+ * - Comprueba la fuente con ffprobe.
+ * - Lanza ffmpeg según el perfil.
+ * - Marca el stream como running y guarda pid, codecs y uptime_started_at.
+ */
+function start_stream($id)
+{
+    $stream = Stream::find($id);
+    $setting = Setting::first();
+    $stream->checkable = 0;
+
+    if ($stream->restream) {
+        // Modo restream simple
+        $stream->checker = 0;
+        $stream->pid = 0;
+        $stream->running = 1;
+        $stream->status = 1;
+
+        // Registrar inicio de uptime
+        $stream->uptime_started_at = date('Y-m-d H:i:s');
+
+    } else {
+        // Modo normal: primero comprobamos el stream con ffprobe
+        $stream->checker = 0;
+        $checkstreamurl = shell_exec('' . $setting->ffprobe_path . ' -analyzeduration 1000000 -probesize 1000000 -i "' . $stream->streamurl . '" -v  quiet -print_format json -show_streams 2>&1');
+        $streaminfo = json_decode($checkstreamurl, true);
+
+        if ($streaminfo) {
+            // Lanzar ffmpeg con el comando generado por getTranscode()
+            $pid = exec(sprintf(
+                "%s > %s 2>&1 & echo $!",
+                getTranscode($stream->id),
+                "/opt/streamtool/app/www/" . $setting->hlsfolder ."/" . $stream->id ."_.log"
+            ));
+
+            $stream->pid = $pid;
+            $stream->running = 1;
+            $stream->status = 1;
+
+            // Registrar inicio de uptime cuando realmente arranca ffmpeg
+            $stream->uptime_started_at = date('Y-m-d H:i:s');
+
+            // Detectar codecs de video/audio desde ffprobe
+            $video = "";
+            $audio = "";
+            if (is_array($streaminfo)) {
+                foreach ($streaminfo['streams'] as $info) {
+                    if ($video == '') {
+                        $video = ($info['codec_type'] == 'video' ? $info['codec_name'] : '');
+                    }
+                    if ($audio == '') {
+                        $audio = ($info['codec_type'] == 'audio' ? $info['codec_name'] : '');
+                    }
+                }
+                $stream->video_codec_name = $video;
+                $stream->audio_codec_name = $audio;
+            }
+        } else {
+            // Primer URL no válida → marcar como error o probar fallback
+            $stream->running = 1;
+            $stream->status = 2;
+
+            if (checkPid($stream->pid)) {
+                shell_exec("kill -9 " . $stream->pid);
+                shell_exec("/bin/rm -r /opt/streamtool/app/www/" . $setting->hlsfolder . "/" . $stream->id . "*");
+            }
+
+            if ($stream->streamurl2) {
+                // Segundo intento con streamurl2
+                $stream->checker = 2;
+
+                $checkstreamurl = shell_exec('' . $setting->ffprobe_path . ' -analyzeduration 1000000 -probesize 1000000 -i "' . $stream->streamurl . '" -v  quiet -print_format json -show_streams 2>&1');
+                $streaminfo = json_decode($checkstreamurl, true);
+
+                if ($streaminfo) {
+                    $pid = exec(sprintf(
+                        "%s > %s 2>&1 & echo $!",
+                        getTranscode($stream->id, 2),
+                        "/opt/streamtool/app/www/" . $setting->hlsfolder ."/" . $stream->id ."_.log"
+                    ));
+                    $stream->pid = $pid;
+                    $stream->running = 1;
+                    $stream->status = 1;
+
+                    // Registrar inicio de uptime al arrancar en streamurl2
+                    $stream->uptime_started_at = date('Y-m-d H:i:s');
+
+                    $video = "";
+                    $audio = "";
+                    if (is_array($streaminfo)) {
+                        foreach ($streaminfo['streams'] as $info) {
+                            if ($video == '') {
+                                $video = ($info['codec_type'] == 'video' ? $info['codec_name'] : '');
+                            }
+                            if ($audio == '') {
+                                $audio = ($info['codec_type'] == 'audio' ? $info['codec_name'] : '');
+                            }
+                        }
+                        $stream->video_codec_name = $video;
+                        $stream->audio_codec_name = $audio;
+                    }
+                } else {
+                    // Fallback a streamurl3 si existe
+                    $stream->running = 1;
+                    $stream->status = 2;
+
+                    if (checkPid($stream->pid)) {
+                        shell_exec("kill -9 " . $stream->pid);
+                        shell_exec("/bin/rm -r /opt/streamtool/app/www/" . $setting->hlsfolder . "/" . $stream->id . "*");
+                    }
+
+                    if ($stream->streamurl3) {
+                        $stream->checker = 3;
+                        $checkstreamurl = shell_exec('' . $setting->ffprobe_path . ' -analyzeduration 1000000 -probesize 1000000 -i "' . $stream->streamurl . '" -v  quiet -print_format json -show_streams 2>&1');
+                        $streaminfo = json_decode($checkstreamurl, true);
+                        if ($streaminfo) {
+
+                            $pid = exec(sprintf(
+                                "%s > %s 2>&1 & echo $!",
+                                getTranscode($stream->id, 3),
+                                "/opt/streamtool/app/www/" . $setting->hlsfolder ."/" . $stream->id ."_.log"
+                            ));
+
+                            $stream->pid = $pid;
+                            $stream->running = 1;
+                            $stream->status = 1;
+
+                            // Registrar inicio de uptime al arrancar en streamurl3
+                            $stream->uptime_started_at = date('Y-m-d H:i:s');
+
+                            $video = "";
+                            $audio = "";
+
+                            if (is_array($streaminfo)) {
+                                foreach ($streaminfo['streams'] as $info) {
+                                    if ($video == '') {
+                                        $video = ($info['codec_type'] == 'video' ? $info['codec_name'] : '');
+                                    }
+                                    if ($audio == '') {
+                                        $audio = ($info['codec_type'] == 'audio' ? $info['codec_name'] : '');
+                                    }
+                                }
+                                $stream->video_codec_name = $video;
+                                $stream->audio_codec_name = $audio;
+                            }
+                        } else {
+                            // Ninguna URL válida → error
+                            $stream->running = 1;
+                            $stream->status = 2;
+                            $stream->pid = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Habilitamos checkeo por el watcher
+    $stream->checkable = 1;
+    $stream->save();
+}
+
+/**
+ * Genera nginx.conf dinámicamente para el puerto de streaming y para el panel.
+ * OJO: aquí sigue usando /opt/streamtool/app/wws/ como root para streaming;
+ * ya ajustaste el nginx real a /www/, esto solo se usa si regeneras el conf.
+ */
+function generateNginxConfPort($port)
+{
+    ob_start();
+    echo 'user  streamtool;
+worker_processes  auto;
+worker_rlimit_nofile 655350;
+
+events {
+    worker_connections  65535;
+    use epoll;
+        accept_mutex on;
+        multi_accept on;
+}
+
+http {
+        include                   mime.types;
+        default_type              application/octet-stream;
+        sendfile                  on;
+        tcp_nopush                on;
+        tcp_nodelay               on;
+        reset_timedout_connection on;
+        gzip                      off;
+        fastcgi_read_timeout      200;
+        access_log                off;
+        keepalive_timeout         10;
+        client_max_body_size      999m;
+        send_timeout              120s;
+        sendfile_max_chunk        512k;
+        lingering_close           off;
+	server {
+		listen ' . $port . ';
+		root /opt/streamtool/app/wws/;
+		server_tokens off;
+		chunked_transfer_encoding off;
+        rewrite ^/live/(.*)/(.*)/(.*)$ /stream.php?username=$1&password=$2&stream=$3 break;
+        rewrite ^/mpegts/(.*)/(.*)/(.*)$ /mpegts.php?username=$1&password=$2&stream=$3 break;
+		location ~ \.php$ {
+            try_files $uri =404;
+            fastcgi_index index.php;
+            include fastcgi_params;
+            fastcgi_buffering on;
+            fastcgi_buffers 96 32k;
+            fastcgi_buffer_size 32k;
+            fastcgi_max_temp_file_size 0;
+            fastcgi_keep_conn on;
+            fastcgi_param SCRIPT_FILENAME /opt/streamtool/app/wws/$fastcgi_script_name;
+            fastcgi_param SCRIPT_NAME $fastcgi_script_name;
+            fastcgi_pass unix:/opt/streamtool/app/php/var/run/stream.sock;
+		}	
+	}
+	server {
+		listen 9001;
+		root /opt/streamtool/app/www/;
+                index index.php index.html index.htm;
+                server_tokens off;
+                chunked_transfer_encoding off;
+		location ~ \.php$ {
+                        try_files $uri =404;
+                        fastcgi_index index.php;
+                        include fastcgi_params;
+                        fastcgi_buffering on;
+                        fastcgi_buffers 96 32k;
+                        fastcgi_buffer_size 32k;
+                        fastcgi_max_temp_file_size 0;
+                        fastcgi_keep_conn on;
+                        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                        fastcgi_param SCRIPT_NAME $fastcgi_script_name;
+                        fastcgi_pass 127.0.0.1:9002;
+		}
+	}
+}';
+    $file = '/opt/streamtool/app/nginx/conf/nginx.conf';
+    $current = ob_get_clean();
+    file_put_contents($file, $current);
+}

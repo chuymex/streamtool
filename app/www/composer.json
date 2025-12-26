@@ -1,0 +1,14 @@
+{
+    "require": {
+        "philo/laravel-blade": "3.*",
+        "nesbot/carbon": "^2.0.0",
+	"illuminate/database": "5.*"
+    },
+    "autoload": {
+        "classmap": [
+            "models"
+        ]
+    },
+    "require-dev": {
+    }
+}
